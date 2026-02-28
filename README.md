@@ -6,7 +6,7 @@ A LangGraph pipeline that demonstrates how an **SLM pre-processing step** preser
 
 Standard RAG pipelines chunk documents naively. When footnotes are separated from the sentences they qualify, the LLM summarizer never sees the critical fine print — producing summaries that can be **dangerously misleading** (e.g., reporting "$2.4B revenue with 34% growth" without noting that nearly all growth came from an acquisition and organic growth was only 3.2%).
 
-## Solution: The "Specialist & Executive" Architecture
+## Solution: The "Stitch & Summarize" Architecture
 
 ```
 Load Document
@@ -23,10 +23,10 @@ Both summaries → Markdown report + heatmap PNG + interactive HTML audit report
 
 | Step | Component | Default Model |
 |---|---|---|
-| Pre-processing | SLM "Librarian" — footnote stitcher | `gpt-5-mini` |
+| Pre-processing | SLM Stitcher — inlines footnote definitions | `gpt-5-mini` |
 | Chunking | `RecursiveCharacterTextSplitter` (footnote-boundary-aware) | — |
 | Storage & Retrieval | FAISS in-memory vector store | `text-embedding-3-small` |
-| Summarization | LLM "Executive" — financial analyst | `gpt-5.2` |
+| Summarization | LLM Summarizer — financial analyst | `gpt-5.2` |
 
 ## Quick Start
 
@@ -146,7 +146,7 @@ Financial, legal, and regulatory documents routinely place **material qualificat
 
 ### Solution Overview
 
-The pipeline inserts an **SLM pre-processing layer** ("the Librarian") between document loading and chunking. This smaller, cheaper model re-writes the document with every footnote definition inlined next to its citing sentence, so that downstream chunking and retrieval always keep claim + qualification together.
+The pipeline inserts an **SLM pre-processing layer** (the Stitcher) between document loading and chunking. This smaller, cheaper model re-writes the document with every footnote definition inlined next to its citing sentence, so that downstream chunking and retrieval always keep claim + qualification together.
 
 ### Pipeline Nodes (LangGraph DAG)
 
@@ -241,7 +241,7 @@ The enriched text is also patched in-place: any remaining `{FOOTNOTE [N]: MISSIN
 |---|---|
 | **Enriched Chunker** | Splits stitched text with `RecursiveCharacterTextSplitter`, but first collapses newlines inside `{FOOTNOTE ...}` blocks so the splitter treats each annotation as a single token — preventing footnote blocks from being split across chunks. |
 | **Multi-Query FAISS Retrieval** | Two independent vector stores are built (raw chunks vs. enriched chunks) using the same embedding model. Instead of a single generic query, **5 topical sub-queries** are run against each store (financial performance, cash flow/liquidity, risks, outlook, operational highlights). Results are deduplicated, giving the LLM significantly broader context than a single top-K retrieval. |
-| **LLM Summarization** | The "Executive" LLM receives the combined retrieved chunks and system prompts from external files (`llm-prompt-raw.txt`, `llm-prompt-enriched.txt`). The enriched prompt explicitly instructs the LLM to incorporate `{FOOTNOTE}` qualifications and not present claims as unqualified facts. |
+| **LLM Summarization** | The Summarizer LLM receives the combined retrieved chunks and system prompts from external files (`llm-prompt-raw.txt`, `llm-prompt-enriched.txt`). The enriched prompt explicitly instructs the LLM to incorporate `{FOOTNOTE}` qualifications and not present claims as unqualified facts. |
 | **Reports** | A Markdown comparison report, a matplotlib heatmap showing footnote density per chunk, and a self-contained interactive HTML audit report with scorecard, chunk inspector, footnote registry, and **sentence-level semantic diff**. |
 
 ### Semantic Diff & Colour Coding

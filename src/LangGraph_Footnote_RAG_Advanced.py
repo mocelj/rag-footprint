@@ -291,7 +291,7 @@ def _inject_footnote_appendix(
 
 
 # ---------------------------------------------------------------------------
-# 4. Node: SLM Footnote Stitcher (the "Librarian")
+# 4. Node: SLM Footnote Stitcher
 # ---------------------------------------------------------------------------
 def slm_footnote_stitcher(state: GraphState) -> dict:
     """
