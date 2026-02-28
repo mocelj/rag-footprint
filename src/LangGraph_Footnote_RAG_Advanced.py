@@ -31,6 +31,10 @@ from langchain_core.documents import Document
 from langgraph.graph import StateGraph, START, END
 from pypdf import PdfReader
 
+# Audit & visualization modules (same directory)
+from rag_heatmap_visualizer import generate_heatmap
+from audit_report_generator import generate_audit_report
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -63,6 +67,8 @@ class GraphState(TypedDict):
     raw_summary: str                                           # baseline summary (no SLM)
     enriched_summary: str                                      # summary with SLM enrichment
     report_path: str                                           # path to generated report
+    heatmap_path: str                                          # path to heatmap PNG
+    audit_report_path: str                                     # path to HTML audit report
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +365,45 @@ def generate_report(state: GraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 9. Build the LangGraph Workflow
+# 9. Node: Generate Heatmap & Interactive Audit Report
+# ---------------------------------------------------------------------------
+def generate_audit(state: GraphState) -> dict:
+    """Generate the retrieval heatmap PNG and interactive HTML audit report."""
+    source_path = Path(state["source_file"])
+    output_dir = source_path.parent
+    stem = source_path.stem
+
+    # --- Heatmap ---
+    heatmap_file = output_dir / f"heatmap_{stem}.png"
+    heatmap_path = generate_heatmap(
+        raw_chunks=state["raw_chunks"],
+        enriched_chunks=state["enriched_chunks"],
+        output_path=heatmap_file,
+        source_name=source_path.name,
+    )
+
+    # --- Interactive HTML audit report ---
+    audit_file = output_dir / f"audit_report_{stem}.html"
+    audit_path = generate_audit_report(
+        raw_text=state["raw_text"],
+        enriched_text=state["enriched_text"],
+        raw_chunks=state["raw_chunks"],
+        enriched_chunks=state["enriched_chunks"],
+        footnotes_registry=state.get("footnotes_registry", []),
+        raw_summary=state.get("raw_summary", ""),
+        enriched_summary=state.get("enriched_summary", ""),
+        heatmap_path=heatmap_path,
+        output_path=audit_file,
+        source_name=source_path.name,
+        slm_model=SLM_MODEL,
+        llm_model=LLM_MODEL,
+    )
+
+    return {"heatmap_path": heatmap_path, "audit_report_path": audit_path}
+
+
+# ---------------------------------------------------------------------------
+# 10. Build the LangGraph Workflow
 # ---------------------------------------------------------------------------
 workflow = StateGraph(GraphState)
 
@@ -371,6 +415,7 @@ workflow.add_node("enriched_chunker", enriched_chunker)
 workflow.add_node("summarize_raw", summarize_raw)
 workflow.add_node("summarize_enriched", summarize_enriched)
 workflow.add_node("generate_report", generate_report)
+workflow.add_node("generate_audit", generate_audit)
 
 # Define edges (sequential pipeline)
 workflow.add_edge(START, "load_document")
@@ -380,14 +425,15 @@ workflow.add_edge("slm_footnote_stitcher", "enriched_chunker")
 workflow.add_edge("enriched_chunker", "summarize_raw")
 workflow.add_edge("summarize_raw", "summarize_enriched")
 workflow.add_edge("summarize_enriched", "generate_report")
-workflow.add_edge("generate_report", END)
+workflow.add_edge("generate_report", "generate_audit")
+workflow.add_edge("generate_audit", END)
 
 # Compile
 app = workflow.compile()
 
 
 # ---------------------------------------------------------------------------
-# 10. CLI Entry Point
+# 11. CLI Entry Point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     # Determine input file
@@ -422,12 +468,16 @@ if __name__ == "__main__":
         "raw_summary": "",
         "enriched_summary": "",
         "report_path": "",
+        "heatmap_path": "",
+        "audit_report_path": "",
     }
 
     result = app.invoke(initial_state)
 
     print("\n" + "=" * 60)
     print("  Pipeline complete!")
-    print(f"  Report: {result['report_path']}")
+    print(f"  Report:       {result['report_path']}")
+    print(f"  Heatmap:      {result['heatmap_path']}")
+    print(f"  Audit Report: {result['audit_report_path']}")
     print(f"  Footnotes found: {len(result['footnotes_registry'])}")
     print("=" * 60)
