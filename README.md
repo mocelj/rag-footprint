@@ -91,7 +91,7 @@ All model choices are configurable via `.env`:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PROVIDER` | `openai` | `openai` or `azure` — selects which backend to use |
+| `PROVIDER` | `azure` | `openai` or `azure` — selects which backend to use |
 | `OPENAI_API_KEY` | — | Required when `PROVIDER=openai` |
 | `AZURE_OPENAI_ENDPOINT` | — | Required when `PROVIDER=azure` |
 | `AZURE_OPENAI_API_KEY` | — | Azure API key (omit for Entra ID / RBAC keyless auth) |
