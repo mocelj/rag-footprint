@@ -93,6 +93,9 @@ All model choices are configurable via `.env`:
 |---|---|---|
 | `PROVIDER` | `openai` | `openai` or `azure` — selects which backend to use |
 | `OPENAI_API_KEY` | — | Required when `PROVIDER=openai` |
+| `AZURE_OPENAI_ENDPOINT` | — | Required when `PROVIDER=azure` |
+| `AZURE_OPENAI_API_KEY` | — | Azure API key (omit for Entra ID / RBAC keyless auth) |
+| `AZURE_OPENAI_API_VERSION` | `2024-12-01-preview` | Azure API version (optional — code defaults if unset) |
 | `SLM_MODEL` | `gpt-5-mini` | Lightweight model (or Azure deployment name) for footnote stitching |
 | `LLM_MODEL` | `gpt-5.2` | Powerful model (or Azure deployment name) for summarization |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model (or Azure deployment name) for FAISS vectors |
@@ -107,7 +110,7 @@ To use Azure OpenAI instead of the public OpenAI API, set `PROVIDER=azure` in yo
 PROVIDER=azure
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_OPENAI_API_KEY=your-azure-openai-api-key
-AZURE_OPENAI_API_VERSION=2024-12-01-preview
+# AZURE_OPENAI_API_VERSION=2024-12-01-preview   # optional — code defaults if unset
 
 SLM_MODEL=gpt-5-mini
 LLM_MODEL=gpt-5
@@ -122,7 +125,7 @@ If your Azure OpenAI resource has API keys disabled, leave `AZURE_OPENAI_API_KEY
 PROVIDER=azure
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 # AZURE_OPENAI_API_KEY is intentionally omitted — using Entra ID / RBAC
-AZURE_OPENAI_API_VERSION=2024-12-01-preview
+# AZURE_OPENAI_API_VERSION=2024-12-01-preview   # optional — code defaults if unset
 
 SLM_MODEL=gpt-5-mini
 LLM_MODEL=gpt-5
