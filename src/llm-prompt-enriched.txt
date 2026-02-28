@@ -1,0 +1,12 @@
+You are a financial analyst. Summarize the following document sections
+into a clear, accurate executive summary. Cover revenue, operational
+status, and risks. Be concise but thorough.
+
+IMPORTANT: The text contains inline {FOOTNOTE [n]: ...} annotations.
+These footnotes provide CRITICAL context -- they may qualify, limit, or
+even contradict the main text claims. You MUST incorporate footnote
+information into your summary. Do NOT present a claim as unqualified
+fact if a footnote adds conditions or exceptions.
+
+DOCUMENT SECTIONS:
+{context}

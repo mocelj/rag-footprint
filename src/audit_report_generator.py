@@ -40,6 +40,82 @@ def _highlight_footnotes_html(text: str) -> str:
     return escaped
 
 
+def _md_to_html(text: str) -> str:
+    """Lightweight Markdown-to-HTML converter for LLM summary output.
+
+    Handles: **bold**, headings (## / ###), bullet lists (- ),
+    numbered lists (1. ), blank-line paragraph breaks, and
+    inline `code`.  Does NOT depend on any external library.
+    """
+    escaped = html.escape(text)
+    lines = escaped.splitlines()
+    out: list[str] = []
+    in_ul = False
+    in_ol = False
+
+    def _close_lists() -> None:
+        nonlocal in_ul, in_ol
+        if in_ul:
+            out.append("</ul>")
+            in_ul = False
+        if in_ol:
+            out.append("</ol>")
+            in_ol = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Blank line → close any open list, add paragraph break
+        if not stripped:
+            _close_lists()
+            out.append("<br>")
+            continue
+
+        # Headings
+        m_h = re.match(r"^(#{1,4})\s+(.*)", stripped)
+        if m_h:
+            _close_lists()
+            level = len(m_h.group(1)) + 1  # ## → <h3>, ### → <h4>
+            level = min(level, 6)
+            out.append(f"<h{level} style='margin:0.6em 0 0.3em'>{m_h.group(2)}</h{level}>")
+            continue
+
+        # Unordered list item
+        m_ul = re.match(r"^[-*]\s+(.*)", stripped)
+        if m_ul:
+            if not in_ul:
+                _close_lists()
+                out.append("<ul style='margin:0.3em 0;padding-left:1.4em'>")
+                in_ul = True
+            out.append(f"<li>{m_ul.group(1)}</li>")
+            continue
+
+        # Ordered list item
+        m_ol = re.match(r"^\d+\.\s+(.*)", stripped)
+        if m_ol:
+            if not in_ol:
+                _close_lists()
+                out.append("<ol style='margin:0.3em 0;padding-left:1.4em'>")
+                in_ol = True
+            out.append(f"<li>{m_ol.group(1)}</li>")
+            continue
+
+        # Regular paragraph line
+        _close_lists()
+        out.append(f"<p style='margin:0.3em 0'>{stripped}</p>")
+
+    _close_lists()
+    result = "\n".join(out)
+
+    # Inline formatting
+    result = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", result)
+    result = re.sub(r"`([^`]+)`",
+                    r"<code style='background:#e5e7eb;padding:0.1em 0.3em;"
+                    r"border-radius:3px;font-size:0.9em'>\1</code>", result)
+
+    return result
+
+
 def _chunk_to_html(chunks: List[str], mode: str) -> str:
     """Render a list of chunks as styled HTML blocks."""
     blocks = []
@@ -198,7 +274,7 @@ def generate_audit_report(
     </div>
   </header>
 
-  <- LivePlatformView.tsx: nodeStyle uses var(--surface); edge labelBgStyle uses Scorecard -->
+  <!-- Scorecard -->
   <div class="scorecard">
     <div class="score-card">
       <h3>Footnotes Found</h3>
@@ -222,7 +298,7 @@ def generate_audit_report(
     </div>
   </div>
 
-  <- LivePlatformView.tsx: nodeStyle uses var(--surface); edge labelBgStyle uses Heatmap -->
+  <!-- Heatmap -->
   <div class="section">
     <h2>Retrieval Heatmap</h2>
     <p>Color-coded map showing which chunks contain footnote context.
@@ -232,22 +308,22 @@ def generate_audit_report(
     {heatmap_html if heatmap_html else '<p style="color:#9ca3af"><em>Heatmap not available</em></p>'}
   </div>
 
-  <- LivePlatformView.tsx: nodeStyle uses var(--surface); edge labelBgStyle uses Summaries -->
+  <!-- Summaries -->
   <div class="section">
     <h2>Summary Comparison</h2>
     <div class="columns">
       <div>
         <h3 style="color:var(--amber)">Baseline (Without SLM)</h3>
-        <div class="summary-box">{html.escape(raw_summary)}</div>
+        <div class="summary-box">{_md_to_html(raw_summary)}</div>
       </div>
       <div>
         <h3 style="color:var(--green)">Enriched (With SLM)</h3>
-        <div class="summary-box">{html.escape(enriched_summary)}</div>
+        <div class="summary-box">{_md_to_html(enriched_summary)}</div>
       </div>
     </div>
   </div>
 
-  <- LivePlatformView.tsx: nodeStyle uses var(--surface); edge labelBgStyle uses Chunk Inspector -->
+  <!-- Chunk Inspector -->
   <div class="section">
     <h2>Chunk Inspector</h2>
     <div class="tab-container">
@@ -262,7 +338,7 @@ def generate_audit_report(
     </div>
   </div>
 
-  <- LivePlatformView.tsx: nodeStyle uses var(--surface); edge labelBgStyle uses Footnotes Table -->
+  <!-- Footnotes Table -->
   <div class="section">
     <h2>Footnote Registry</h2>
     <table>

@@ -25,5 +25,11 @@ archive/
 .DS_Store
 Thumbs.db
 
-# Generated reports (re-creatable by running the pipeline)
+# Generated outputs (re-creatable by running the pipeline)
 data/summary_report_*.md
+data/heatmap_*.png
+data/audit_report_*.html
+data/state_*.json
+
+# Session notes (local only)
+SESSION_STATE.md

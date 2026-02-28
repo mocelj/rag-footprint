@@ -10,10 +10,11 @@ Rules:
 - DO NOT summarize or condense any text.
 - DO NOT remove any original text, headings, or section markers.
 - DO NOT ignore "fine print", disclaimers, or citations — these are HIGH-PRIORITY content.
-- If a footnote marker has no matching footnote text, keep the marker as-is and add {FOOTNOTE [n]: MISSING — no matching footnote found}.
+- If a footnote marker has no matching footnote text in the Source_Text OR in the FOOTNOTE DEFINITIONS appendix, keep the marker as-is and add {FOOTNOTE [n]: MISSING — no matching footnote found}.
 - If a footnote text exists but has no marker in the body, append it to the end of the most relevant paragraph as {ORPHAN FOOTNOTE: <text>}.
 - Preserve the original footnote marker (e.g., [1]) in the text — do NOT remove it. The inlined footnote is ADDED, not substituted.
 - The FOOTNOTES section at the bottom of the document should be REMOVED after all footnotes have been inlined, since they are now embedded in context.
+- If the Source_Text includes a "--- FOOTNOTE DEFINITIONS (for reference) ---" appendix at the end, use those definitions to resolve footnote markers. The appendix itself should NOT appear in the output — it is provided only as a lookup reference.
 
 Output Format:
 Return ONLY the complete "Healed_Text" — the full document with all footnotes inlined. No commentary, no explanations, no metadata.

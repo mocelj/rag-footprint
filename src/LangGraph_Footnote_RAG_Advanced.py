@@ -1,20 +1,22 @@
 """
 Footnote-Aware RAG Pipeline with SLM Pre-processing
 =====================================================
-A LangGraph pipeline that uses an SLM (GPT-5.2-mini) to inline footnotes
-into their referencing text before chunking, then uses an LLM (GPT-5.2)
-to summarize the enriched context via RAG with FAISS retrieval.
+A LangGraph pipeline that uses an SLM to inline footnotes into their
+referencing text before chunking, then uses an LLM to summarize the
+enriched context via RAG with FAISS retrieval.
 
-Produces a Markdown report comparing summaries WITH and WITHOUT the SLM
-footnote-stitching technique.
+Produces a timestamped Markdown report, a heatmap PNG, and an
+interactive HTML audit report comparing summaries WITH and WITHOUT
+the SLM footnote-stitching technique.
 
 Usage:
     python src/LangGraph_Footnote_RAG_Advanced.py [input_file]
     python src/LangGraph_Footnote_RAG_Advanced.py data/Footnote_Validation_Doc.txt
-    python src/LangGraph_Footnote_RAG_Advanced.py data/report.pdf
+    python src/LangGraph_Footnote_RAG_Advanced.py data/Exemplar_Corp_Q3_2025_Earnings.pdf
 """
 
 import operator
+import json
 import os
 import re
 import sys
@@ -25,6 +27,11 @@ from typing import Annotated, List, TypedDict
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+try:
+    from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+except ImportError:  # older langchain-openai versions
+    AzureChatOpenAI = None  # type: ignore[assignment,misc]
+    AzureOpenAIEmbeddings = None  # type: ignore[assignment,misc]
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -42,6 +49,8 @@ from audit_report_generator import generate_audit_report
 _PROJECT_ROOT = Path(__file__).parent.parent
 load_dotenv(_PROJECT_ROOT / ".env")
 
+PROVIDER = os.getenv("PROVIDER", "openai").lower()  # "openai" or "azure"
+
 SLM_MODEL = os.getenv("SLM_MODEL", "gpt-5-mini")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.2")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
@@ -50,9 +59,47 @@ CHUNK_SIZE = 800        # characters per chunk
 CHUNK_OVERLAP = 100     # overlap between chunks
 TOP_K = 4               # number of chunks to retrieve for summarization
 
-# Load SLM system prompt from file
-_PROMPT_PATH = Path(__file__).parent / "slm-prompt.txt"
-SLM_SYSTEM_PROMPT = _PROMPT_PATH.read_text(encoding="utf-8") if _PROMPT_PATH.exists() else ""
+
+# ---------------------------------------------------------------------------
+# Provider-agnostic model factories (OpenAI / Azure OpenAI)
+# ---------------------------------------------------------------------------
+def _make_chat(deployment_or_model: str, **kwargs) -> ChatOpenAI:
+    """Return a ChatOpenAI or AzureChatOpenAI depending on PROVIDER."""
+    if PROVIDER == "azure":
+        if AzureChatOpenAI is None:
+            raise ImportError("AzureChatOpenAI not available — upgrade langchain-openai")
+        return AzureChatOpenAI(
+            azure_deployment=deployment_or_model,
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
+            **kwargs,
+        )
+    return ChatOpenAI(model=deployment_or_model, **kwargs)
+
+
+def _make_embeddings(deployment_or_model: str) -> OpenAIEmbeddings:
+    """Return an OpenAIEmbeddings or AzureOpenAIEmbeddings depending on PROVIDER."""
+    if PROVIDER == "azure":
+        if AzureOpenAIEmbeddings is None:
+            raise ImportError("AzureOpenAIEmbeddings not available — upgrade langchain-openai")
+        return AzureOpenAIEmbeddings(
+            azure_deployment=deployment_or_model,
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
+        )
+    return OpenAIEmbeddings(model=deployment_or_model)
+
+# Load prompt files
+_PROMPT_DIR = Path(__file__).parent
+
+_SLM_PROMPT_PATH = _PROMPT_DIR / "slm-prompt.txt"
+SLM_SYSTEM_PROMPT = _SLM_PROMPT_PATH.read_text(encoding="utf-8") if _SLM_PROMPT_PATH.exists() else ""
+
+_LLM_RAW_PROMPT_PATH = _PROMPT_DIR / "llm-prompt-raw.txt"
+LLM_RAW_PROMPT = _LLM_RAW_PROMPT_PATH.read_text(encoding="utf-8") if _LLM_RAW_PROMPT_PATH.exists() else ""
+
+_LLM_ENRICHED_PROMPT_PATH = _PROMPT_DIR / "llm-prompt-enriched.txt"
+LLM_ENRICHED_PROMPT = _LLM_ENRICHED_PROMPT_PATH.read_text(encoding="utf-8") if _LLM_ENRICHED_PROMPT_PATH.exists() else ""
 
 # ---------------------------------------------------------------------------
 # 1. Graph State
@@ -108,24 +155,144 @@ def naive_chunker(state: GraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 4. Helpers: Pre-extract footnote definitions & page-aware batching
+# ---------------------------------------------------------------------------
+_FOOTNOTE_DEF_RE = re.compile(
+    r"^\[(\d+)\]\s+(.+?)(?=\n\[\d+\]|\nPage \d+/|\nCONFIDENTIAL|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _extract_global_footnote_defs(raw_text: str) -> dict[int, str]:
+    """
+    Pre-scan *raw_text* for every footnote definition line (``[N] <text>``
+    appearing at the start of a line) and return ``{marker_int: full_text}``.
+    Definitions that span multiple lines are captured correctly.
+    """
+    defs: dict[int, str] = {}
+    for m in _FOOTNOTE_DEF_RE.finditer(raw_text):
+        marker = int(m.group(1))
+        text = " ".join(m.group(2).split())  # normalise whitespace
+        # Keep the longer definition if a marker appears more than once
+        if marker not in defs or len(text) > len(defs[marker]):
+            defs[marker] = text
+    return defs
+
+
+def _page_aware_sections(raw_text: str, max_size: int = 4500) -> list[str]:
+    """
+    Split *raw_text* on ``Page N/M`` markers so that every page's body
+    text AND its footnote definitions stay together in the same batch.
+
+    Adjacent pages are merged as long as the combined size stays under
+    *max_size* characters, keeping the number of SLM calls reasonable.
+    """
+    # Split at the boundary *after* each "Page N/M" marker
+    parts = re.split(r"(Page \d+/\d+)", raw_text)
+    # Re-assemble so each element = page content + its "Page N/M" trailer
+    pages: list[str] = []
+    buf = ""
+    for part in parts:
+        buf += part
+        if re.fullmatch(r"Page \d+/\d+", part):
+            pages.append(buf)
+            buf = ""
+    if buf.strip():
+        pages.append(buf)
+
+    # Merge small consecutive pages into batches up to max_size
+    sections: list[str] = []
+    current = ""
+    for page in pages:
+        if current and len(current) + len(page) > max_size:
+            sections.append(current)
+            current = page
+        else:
+            current += page
+    if current.strip():
+        sections.append(current)
+
+    return sections
+
+
+def _inject_footnote_appendix(
+    section: str, global_defs: dict[int, str]
+) -> str:
+    """
+    Append a *Footnote Reference Appendix* to *section* listing the
+    full definitions of every ``[N]`` marker referenced in the section
+    body.  This ensures the SLM always has the definition available even
+    when batching splits references from their definitions.
+    """
+    # Find all [N] markers in the section text
+    markers_in_section = sorted(set(int(m) for m in re.findall(r"\[(\d+)\]", section)))
+    if not markers_in_section:
+        return section
+
+    appendix_lines = []
+    for marker in markers_in_section:
+        if marker in global_defs:
+            appendix_lines.append(f"[{marker}] {global_defs[marker]}")
+
+    if not appendix_lines:
+        return section
+
+    appendix = "\n\n--- FOOTNOTE DEFINITIONS (for reference) ---\n" + "\n".join(appendix_lines)
+    return section + appendix
+
+
+# ---------------------------------------------------------------------------
 # 4. Node: SLM Footnote Stitcher (the "Librarian")
 # ---------------------------------------------------------------------------
 def slm_footnote_stitcher(state: GraphState) -> dict:
     """
     Call the SLM to identify footnote markers in the raw text and inline
     the corresponding footnote definitions next to the citing sentence.
+
+    Strategy:
+    1. Pre-extract a global footnote-definitions dictionary from *raw_text*.
+    2. Split the document on page boundaries (``Page N/M`` markers) so
+       body text and its footnote definitions stay in the same batch.
+    3. Inject a reference appendix into each batch so the SLM has access
+       to any cross-page definitions.
+    4. De-duplicate results preferring real content over MISSING markers,
+       and longer text over truncated entries.
+    5. Post-validate: any footnote still MISSING or truncated is back-
+       filled from the pre-extracted definitions.
     """
-    slm = ChatOpenAI(model=SLM_MODEL, temperature=0.0, max_tokens=4096)
+    slm = _make_chat(SLM_MODEL, temperature=0.0, max_tokens=8192)
+    raw_text = state["raw_text"]
 
-    messages = [
-        {"role": "system", "content": SLM_SYSTEM_PROMPT},
-        {"role": "user", "content": f"Source_Text:\n\n{state['raw_text']}"},
-    ]
+    # --- Step 1: Pre-extract global footnote definitions ---
+    global_defs = _extract_global_footnote_defs(raw_text)
+    print(f"[slm_footnote_stitcher] Pre-extracted {len(global_defs)} footnote definitions from raw text")
 
-    response = slm.invoke(messages)
-    healed_text = response.content.strip()
+    # --- Step 2: Page-aware batching ---
+    SLM_BATCH_SIZE = 4500  # generous per-batch limit
 
-    # Extract footnote registry from the healed text
+    if len(raw_text) <= SLM_BATCH_SIZE * 1.5:
+        # Small document — single pass
+        sections = [raw_text]
+    else:
+        sections = _page_aware_sections(raw_text, max_size=SLM_BATCH_SIZE)
+        print(f"[slm_footnote_stitcher] Document split into {len(sections)} page-aware sections")
+
+    # --- Step 3: Process each batch with injected appendix ---
+    healed_sections = []
+    for i, section in enumerate(sections):
+        enriched_section = _inject_footnote_appendix(section, global_defs)
+        messages = [
+            {"role": "system", "content": SLM_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Source_Text:\n\n{enriched_section}"},
+        ]
+        response = slm.invoke(messages)
+        healed_sections.append(response.content.strip())
+        if len(sections) > 1:
+            print(f"  [slm_footnote_stitcher] Processed section {i+1}/{len(sections)}")
+
+    healed_text = "\n\n".join(healed_sections)
+
+    # --- Step 4: Extract + smart de-duplicate footnote registry ---
     footnote_pattern = re.compile(
         r"\{FOOTNOTE\s*\[(\d+)\]\s*:\s*(.+?)\}", re.DOTALL
     )
@@ -134,14 +301,60 @@ def slm_footnote_stitcher(state: GraphState) -> dict:
         for m in footnote_pattern.finditer(healed_text)
     ]
 
-    # De-duplicate (same marker may appear in multiple chunks later)
-    seen = set()
-    unique_footnotes = []
+    registry: dict[int, dict] = {}
     for fn in footnotes:
-        if fn["marker"] not in seen:
-            seen.add(fn["marker"])
-            unique_footnotes.append(fn)
+        marker = fn["marker"]
+        is_missing = "MISSING" in fn["text"].upper()
+        existing = registry.get(marker)
+        if existing is None:
+            registry[marker] = fn
+        elif "MISSING" in existing["text"].upper() and not is_missing:
+            # Prefer real content over MISSING
+            registry[marker] = fn
+        elif not is_missing and len(fn["text"]) > len(existing["text"]):
+            # Prefer longer (more complete) text
+            registry[marker] = fn
 
+    # --- Step 5: Post-validation backfill from global defs ---
+    backfilled = 0
+    for marker, defn_text in global_defs.items():
+        entry = registry.get(marker)
+        if entry is None:
+            # Not discovered by SLM at all — backfill
+            registry[marker] = {
+                "marker": marker,
+                "text": defn_text,
+                "status": "backfilled",
+            }
+            backfilled += 1
+        elif "MISSING" in entry["text"].upper():
+            # SLM marked it MISSING but we have the definition
+            registry[marker] = {
+                "marker": marker,
+                "text": defn_text,
+                "status": "backfilled",
+            }
+            backfilled += 1
+            # Also patch the healed text so downstream sees the real content
+            healed_text = re.sub(
+                rf"\{{FOOTNOTE\s*\[{marker}\]\s*:\s*MISSING[^}}]*\}}",
+                f"{{FOOTNOTE [{marker}]: {defn_text}}}",
+                healed_text,
+                count=0,
+            )
+        elif len(entry["text"]) < len(defn_text) * 0.6:
+            # Truncated — the SLM text is much shorter than the definition
+            registry[marker] = {
+                "marker": marker,
+                "text": defn_text,
+                "status": "backfilled",
+            }
+            backfilled += 1
+
+    unique_footnotes = sorted(registry.values(), key=lambda fn: fn["marker"])
+
+    if backfilled:
+        print(f"[slm_footnote_stitcher] Backfilled {backfilled} footnotes from pre-extracted definitions")
     print(f"[slm_footnote_stitcher] Inlined {len(unique_footnotes)} footnotes")
     return {
         "enriched_text": healed_text,
@@ -185,7 +398,7 @@ def summarize_raw(state: GraphState) -> dict:
     Build a FAISS index from raw (non-stitched) chunks, retrieve the
     most relevant ones, and ask the LLM for a summary — baseline mode.
     """
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    embeddings = _make_embeddings(EMBEDDING_MODEL)
     docs = [Document(page_content=c, metadata={"has_footnote": False}) for c in state["raw_chunks"]]
     vectorstore = FAISS.from_documents(docs, embeddings)
 
@@ -193,15 +406,8 @@ def summarize_raw(state: GraphState) -> dict:
     retrieved = vectorstore.similarity_search(query, k=TOP_K)
     context = "\n\n---\n\n".join(doc.page_content for doc in retrieved)
 
-    llm = ChatOpenAI(model=LLM_MODEL, temperature=0.0, max_tokens=2048)
-    prompt = textwrap.dedent(f"""\
-        You are a financial analyst. Summarize the following document sections
-        into a clear, accurate executive summary. Cover revenue, operational
-        status, and risks. Be concise but thorough.
-
-        DOCUMENT SECTIONS:
-        {context}
-    """)
+    llm = _make_chat(LLM_MODEL, temperature=0.0, max_tokens=2048)
+    prompt = LLM_RAW_PROMPT.replace("{context}", context)
     response = llm.invoke([{"role": "user", "content": prompt}])
     summary = response.content.strip()
     print(f"[summarize_raw] Generated baseline summary ({len(summary)} chars)")
@@ -215,14 +421,20 @@ def summarize_enriched(state: GraphState) -> dict:
     """
     Build a FAISS index from enriched (footnote-stitched) chunks, retrieve
     the most relevant ones, and ask the LLM for a summary — enriched mode.
+    Falls back to raw chunks if the SLM produced no enriched chunks.
     """
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    chunks = state["enriched_chunks"] if state["enriched_chunks"] else state["raw_chunks"]
+    if not chunks:
+        print("[summarize_enriched] No chunks available — skipping")
+        return {"enriched_summary": "(no enriched summary — no chunks available)"}
+
+    embeddings = _make_embeddings(EMBEDDING_MODEL)
     docs = [
         Document(
             page_content=c,
             metadata={"has_footnote": bool(re.search(r"\{FOOTNOTE", c))},
         )
-        for c in state["enriched_chunks"]
+        for c in chunks
     ]
     vectorstore = FAISS.from_documents(docs, embeddings)
 
@@ -230,21 +442,8 @@ def summarize_enriched(state: GraphState) -> dict:
     retrieved = vectorstore.similarity_search(query, k=TOP_K)
     context = "\n\n---\n\n".join(doc.page_content for doc in retrieved)
 
-    llm = ChatOpenAI(model=LLM_MODEL, temperature=0.0, max_tokens=2048)
-    prompt = textwrap.dedent(f"""\
-        You are a financial analyst. Summarize the following document sections
-        into a clear, accurate executive summary. Cover revenue, operational
-        status, and risks. Be concise but thorough.
-
-        IMPORTANT: The text contains inline {{FOOTNOTE [n]: ...}} annotations.
-        These footnotes provide CRITICAL context — they may qualify, limit, or
-        even contradict the main text claims. You MUST incorporate footnote
-        information into your summary. Do NOT present a claim as unqualified
-        fact if a footnote adds conditions or exceptions.
-
-        DOCUMENT SECTIONS:
-        {context}
-    """)
+    llm = _make_chat(LLM_MODEL, temperature=0.0, max_tokens=2048)
+    prompt = LLM_ENRICHED_PROMPT.replace("{context}", context)
     response = llm.invoke([{"role": "user", "content": prompt}])
     summary = response.content.strip()
     print(f"[summarize_enriched] Generated enriched summary ({len(summary)} chars)")
@@ -258,7 +457,8 @@ def generate_report(state: GraphState) -> dict:
     """Write a Markdown report comparing both summaries side by side."""
     source = Path(state["source_file"]).name
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    report_name = f"summary_report_{Path(state['source_file']).stem}.md"
+    ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_name = f"summary_report_{Path(state['source_file']).stem}_{ts_tag}.md"
     report_path = Path(state["source_file"]).parent / report_name
 
     # Format footnotes table
@@ -306,9 +506,9 @@ def generate_report(state: GraphState) -> dict:
     while the enriched summary incorporates footnote qualifications that
     may materially change interpretation. Compare how each version handles:
 
-    - **Revenue figures** — Does the summary mention the one-time insurance payout?
-    - **Growth expectations** — Does it note the merger contingency?
-    - **Operational capacity** — Does it mention broken machinery?
+    - **Revenue composition** — Does the summary flag one-time items or acquisition effects?
+    - **Forward guidance** — Does it note conditions, risks, or contingencies in the footnotes?
+    - **Reported metrics** — Does it surface GAAP vs. non-GAAP discrepancies?
 
     ---
 
@@ -372,9 +572,10 @@ def generate_audit(state: GraphState) -> dict:
     source_path = Path(state["source_file"])
     output_dir = source_path.parent
     stem = source_path.stem
+    ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # --- Heatmap ---
-    heatmap_file = output_dir / f"heatmap_{stem}.png"
+    heatmap_file = output_dir / f"heatmap_{stem}_{ts_tag}.png"
     heatmap_path = generate_heatmap(
         raw_chunks=state["raw_chunks"],
         enriched_chunks=state["enriched_chunks"],
@@ -383,7 +584,7 @@ def generate_audit(state: GraphState) -> dict:
     )
 
     # --- Interactive HTML audit report ---
-    audit_file = output_dir / f"audit_report_{stem}.html"
+    audit_file = output_dir / f"audit_report_{stem}_{ts_tag}.html"
     audit_path = generate_audit_report(
         raw_text=state["raw_text"],
         enriched_text=state["enriched_text"],
@@ -433,10 +634,80 @@ app = workflow.compile()
 
 
 # ---------------------------------------------------------------------------
-# 11. CLI Entry Point
+# 11. State Serialization Helpers
+# ---------------------------------------------------------------------------
+_STATE_SERIALIZABLE_KEYS = [
+    "source_file", "raw_text", "enriched_text", "footnotes_registry",
+    "raw_chunks", "enriched_chunks", "raw_summary", "enriched_summary",
+    "report_path", "heatmap_path", "audit_report_path",
+]
+
+
+def _save_state(state: dict, output_dir: Path, stem: str, ts_tag: str) -> str:
+    """Persist pipeline state to a JSON file for later re-rendering."""
+    data = {k: state.get(k, "") for k in _STATE_SERIALIZABLE_KEYS}
+    state_file = output_dir / f"state_{stem}_{ts_tag}.json"
+    state_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[save_state] Saved pipeline state to {state_file}")
+    return str(state_file)
+
+
+def _load_state(state_path: Path) -> dict:
+    """Load a previously saved pipeline state from JSON."""
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    return data
+
+
+def _rerender(state: dict) -> None:
+    """Re-generate only the report, heatmap, and audit HTML from saved state."""
+    # Re-run generate_report
+    report_result = generate_report(state)
+    state.update(report_result)
+
+    # Re-run generate_audit
+    audit_result = generate_audit(state)
+    state.update(audit_result)
+
+    # Save updated state
+    source_path = Path(state["source_file"])
+    ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _save_state(state, source_path.parent, source_path.stem, ts_tag)
+
+
+# ---------------------------------------------------------------------------
+# 12. CLI Entry Point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Determine input file
+    # --rerender mode: regenerate outputs from saved state JSON
+    if len(sys.argv) > 1 and sys.argv[1] == "--rerender":
+        if len(sys.argv) < 3:
+            print("Usage: python src/LangGraph_Footnote_RAG_Advanced.py --rerender <state.json>")
+            sys.exit(1)
+        state_path = Path(sys.argv[2])
+        if not state_path.is_absolute():
+            state_path = _PROJECT_ROOT / state_path
+        if not state_path.exists():
+            print(f"Error: State file not found — {state_path}")
+            sys.exit(1)
+
+        print("=" * 60)
+        print("  Footnote-Aware RAG Pipeline — Re-render Mode")
+        print(f"  State: {state_path.name}")
+        print("=" * 60)
+
+        saved = _load_state(state_path)
+        _rerender(saved)
+
+        print("\n" + "=" * 60)
+        print("  Re-render complete!")
+        print(f"  Report:       {saved['report_path']}")
+        print(f"  Heatmap:      {saved['heatmap_path']}")
+        print(f"  Audit Report: {saved['audit_report_path']}")
+        print(f"  Footnotes:    {len(saved.get('footnotes_registry', []))}")
+        print("=" * 60)
+        sys.exit(0)
+
+    # Normal mode: full pipeline run
     if len(sys.argv) > 1:
         input_file = sys.argv[1]
     else:
@@ -474,10 +745,17 @@ if __name__ == "__main__":
 
     result = app.invoke(initial_state)
 
+    # Save state for future re-rendering
+    ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    state_file = _save_state(result, input_path.parent, input_path.stem, ts_tag)
+
     print("\n" + "=" * 60)
     print("  Pipeline complete!")
     print(f"  Report:       {result['report_path']}")
     print(f"  Heatmap:      {result['heatmap_path']}")
     print(f"  Audit Report: {result['audit_report_path']}")
+    print(f"  State:        {state_file}")
     print(f"  Footnotes found: {len(result['footnotes_registry'])}")
     print("=" * 60)
+    print(f"\n  To re-render outputs without re-running the pipeline:")
+    print(f"  python3 src/LangGraph_Footnote_RAG_Advanced.py --rerender {state_file}")

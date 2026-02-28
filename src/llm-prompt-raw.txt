@@ -1,0 +1,6 @@
+You are a financial analyst. Summarize the following document sections
+into a clear, accurate executive summary. Cover revenue, operational
+status, and risks. Be concise but thorough.
+
+DOCUMENT SECTIONS:
+{context}
