@@ -32,6 +32,11 @@ try:
 except ImportError:  # older langchain-openai versions
     AzureChatOpenAI = None  # type: ignore[assignment,misc]
     AzureOpenAIEmbeddings = None  # type: ignore[assignment,misc]
+try:
+    from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+except ImportError:  # azure-identity not installed
+    DefaultAzureCredential = None  # type: ignore[assignment,misc]
+    get_bearer_token_provider = None  # type: ignore[assignment,misc]
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -57,36 +62,80 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
 CHUNK_SIZE = 800        # characters per chunk
 CHUNK_OVERLAP = 100     # overlap between chunks
-TOP_K = 4               # number of chunks to retrieve for summarization
+TOP_K = 4               # chunks to retrieve **per sub-query**
+
+# Multi-query retrieval — each sub-query targets a distinct topic so the
+# combined results cover the full breadth of the document.  Duplicates are
+# removed before the context is sent to the LLM.
+RETRIEVAL_QUERIES = [
+    "Financial performance, revenue, earnings, and profitability metrics",
+    "Cash flow, capital expenditure, liquidity, and debt position",
+    "Risks, challenges, regulatory issues, and compliance concerns",
+    "Strategic outlook, forward guidance, and growth projections",
+    "Operational highlights, market position, and competitive landscape",
+]
 
 
 # ---------------------------------------------------------------------------
 # Provider-agnostic model factories (OpenAI / Azure OpenAI)
 # ---------------------------------------------------------------------------
+def _azure_token_provider():
+    """Build a bearer-token provider for Azure OpenAI (Entra ID / RBAC).
+
+    Requires ``azure-identity`` and a prior ``az login``.
+    """
+    if DefaultAzureCredential is None or get_bearer_token_provider is None:
+        raise ImportError(
+            "azure-identity is required for keyless Azure auth — "
+            "pip install azure-identity"
+        )
+    credential = DefaultAzureCredential()
+    return get_bearer_token_provider(
+        credential, "https://cognitiveservices.azure.com/.default"
+    )
+
+
 def _make_chat(deployment_or_model: str, **kwargs) -> ChatOpenAI:
-    """Return a ChatOpenAI or AzureChatOpenAI depending on PROVIDER."""
+    """Return a ChatOpenAI or AzureChatOpenAI depending on PROVIDER.
+
+    For Azure: uses API key if ``AZURE_OPENAI_API_KEY`` is set, otherwise
+    falls back to Entra ID / RBAC via ``DefaultAzureCredential``.
+    """
     if PROVIDER == "azure":
         if AzureChatOpenAI is None:
             raise ImportError("AzureChatOpenAI not available — upgrade langchain-openai")
-        return AzureChatOpenAI(
+        azure_kwargs = dict(
             azure_deployment=deployment_or_model,
             azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
             api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
-            **kwargs,
         )
+        if os.getenv("AZURE_OPENAI_API_KEY"):
+            azure_kwargs["api_key"] = os.environ["AZURE_OPENAI_API_KEY"]
+        else:
+            azure_kwargs["azure_ad_token_provider"] = _azure_token_provider()
+        return AzureChatOpenAI(**azure_kwargs, **kwargs)
     return ChatOpenAI(model=deployment_or_model, **kwargs)
 
 
 def _make_embeddings(deployment_or_model: str) -> OpenAIEmbeddings:
-    """Return an OpenAIEmbeddings or AzureOpenAIEmbeddings depending on PROVIDER."""
+    """Return an OpenAIEmbeddings or AzureOpenAIEmbeddings depending on PROVIDER.
+
+    For Azure: uses API key if ``AZURE_OPENAI_API_KEY`` is set, otherwise
+    falls back to Entra ID / RBAC via ``DefaultAzureCredential``.
+    """
     if PROVIDER == "azure":
         if AzureOpenAIEmbeddings is None:
             raise ImportError("AzureOpenAIEmbeddings not available — upgrade langchain-openai")
-        return AzureOpenAIEmbeddings(
+        azure_kwargs = dict(
             azure_deployment=deployment_or_model,
             azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
             api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
         )
+        if os.getenv("AZURE_OPENAI_API_KEY"):
+            azure_kwargs["api_key"] = os.environ["AZURE_OPENAI_API_KEY"]
+        else:
+            azure_kwargs["azure_ad_token_provider"] = _azure_token_provider()
+        return AzureOpenAIEmbeddings(**azure_kwargs)
     return OpenAIEmbeddings(model=deployment_or_model)
 
 # Load prompt files
@@ -260,7 +309,7 @@ def slm_footnote_stitcher(state: GraphState) -> dict:
     5. Post-validate: any footnote still MISSING or truncated is back-
        filled from the pre-extracted definitions.
     """
-    slm = _make_chat(SLM_MODEL, temperature=0.0, max_tokens=8192)
+    slm = _make_chat(SLM_MODEL, max_tokens=8192)
     raw_text = state["raw_text"]
 
     # --- Step 1: Pre-extract global footnote definitions ---
@@ -391,6 +440,26 @@ def enriched_chunker(state: GraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Multi-query retrieval helper
+# ---------------------------------------------------------------------------
+def _multi_query_retrieve(vectorstore, k_per_query: int = TOP_K) -> list[Document]:
+    """Run multiple topical queries against *vectorstore* and deduplicate."""
+    seen: set[str] = set()
+    results: list[Document] = []
+    for query in RETRIEVAL_QUERIES:
+        for doc in vectorstore.similarity_search(query, k=k_per_query):
+            key = doc.page_content[:200]  # first 200 chars as identity key
+            if key not in seen:
+                seen.add(key)
+                results.append(doc)
+    print(
+        f"[multi_query_retrieve] {len(RETRIEVAL_QUERIES)} queries × k={k_per_query}"
+        f" → {len(results)} unique chunks"
+    )
+    return results
+
+
+# ---------------------------------------------------------------------------
 # 6. Node: Build FAISS Vector Stores & Summarize (Raw — baseline)
 # ---------------------------------------------------------------------------
 def summarize_raw(state: GraphState) -> dict:
@@ -402,11 +471,10 @@ def summarize_raw(state: GraphState) -> dict:
     docs = [Document(page_content=c, metadata={"has_footnote": False}) for c in state["raw_chunks"]]
     vectorstore = FAISS.from_documents(docs, embeddings)
 
-    query = "Summarize the key financial metrics, operational status, and any risks."
-    retrieved = vectorstore.similarity_search(query, k=TOP_K)
+    retrieved = _multi_query_retrieve(vectorstore)
     context = "\n\n---\n\n".join(doc.page_content for doc in retrieved)
 
-    llm = _make_chat(LLM_MODEL, temperature=0.0, max_tokens=2048)
+    llm = _make_chat(LLM_MODEL, max_tokens=2048)
     prompt = LLM_RAW_PROMPT.replace("{context}", context)
     response = llm.invoke([{"role": "user", "content": prompt}])
     summary = response.content.strip()
@@ -438,11 +506,10 @@ def summarize_enriched(state: GraphState) -> dict:
     ]
     vectorstore = FAISS.from_documents(docs, embeddings)
 
-    query = "Summarize the key financial metrics, operational status, and any risks."
-    retrieved = vectorstore.similarity_search(query, k=TOP_K)
+    retrieved = _multi_query_retrieve(vectorstore)
     context = "\n\n---\n\n".join(doc.page_content for doc in retrieved)
 
-    llm = _make_chat(LLM_MODEL, temperature=0.0, max_tokens=2048)
+    llm = _make_chat(LLM_MODEL, max_tokens=2048)
     prompt = LLM_ENRICHED_PROMPT.replace("{context}", context)
     response = llm.invoke([{"role": "user", "content": prompt}])
     summary = response.content.strip()
@@ -478,7 +545,7 @@ def generate_report(state: GraphState) -> dict:
     | **SLM Model** | `{SLM_MODEL}` |
     | **LLM Model** | `{LLM_MODEL}` |
     | **Chunk Size** | {CHUNK_SIZE} chars |
-    | **Top-K Retrieval** | {TOP_K} |
+    | **Retrieval** | Multi-query ({len(RETRIEVAL_QUERIES)} sub-queries × k={TOP_K}) |
 
     ---
 
@@ -509,6 +576,16 @@ def generate_report(state: GraphState) -> dict:
     - **Revenue composition** — Does the summary flag one-time items or acquisition effects?
     - **Forward guidance** — Does it note conditions, risks, or contingencies in the footnotes?
     - **Reported metrics** — Does it surface GAAP vs. non-GAAP discrepancies?
+    - **Cash flow & liquidity** — Does it include capex context and debt detail?
+    - **Operational highlights** — Does it cover market position and competitive landscape?
+
+    > **Tip — HTML Audit Report colour coding:**
+    > Open the companion `audit_report_*.html` for a visual, sentence-level
+    > semantic diff.  Sentences with an **amber left-border** appear only in
+    > the baseline summary (information lost or absent in the enriched version).
+    > Sentences with a **green left-border** appear only in the enriched
+    > summary (new insights surfaced by footnote stitching).  Sentences with
+    > no border are semantically shared by both summaries.
 
     ---
 
@@ -598,6 +675,7 @@ def generate_audit(state: GraphState) -> dict:
         source_name=source_path.name,
         slm_model=SLM_MODEL,
         llm_model=LLM_MODEL,
+        embeddings_model=_make_embeddings(EMBEDDING_MODEL),
     )
 
     return {"heatmap_path": heatmap_path, "audit_report_path": audit_path}

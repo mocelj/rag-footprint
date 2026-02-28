@@ -99,7 +99,9 @@ All model choices are configurable via `.env`:
 
 ### Azure OpenAI
 
-To use Azure OpenAI instead of the public OpenAI API, set `PROVIDER=azure` and add the Azure-specific variables to your `.env`:
+To use Azure OpenAI instead of the public OpenAI API, set `PROVIDER=azure` in your `.env`.
+
+**Option A — API Key auth:**
 
 ```dotenv
 PROVIDER=azure
@@ -107,13 +109,31 @@ AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_OPENAI_API_KEY=your-azure-openai-api-key
 AZURE_OPENAI_API_VERSION=2024-12-01-preview
 
-# Use your Azure deployment names:
-SLM_MODEL=gpt-4o-mini
-LLM_MODEL=gpt-4o
+SLM_MODEL=gpt-5-mini
+LLM_MODEL=gpt-5
 EMBEDDING_MODEL=text-embedding-3-small
 ```
 
-The pipeline auto-switches between `ChatOpenAI` / `AzureChatOpenAI` and `OpenAIEmbeddings` / `AzureOpenAIEmbeddings` based on the `PROVIDER` value. No code changes required.
+**Option B — Entra ID / RBAC (keyless):**
+
+If your Azure OpenAI resource has API keys disabled, leave `AZURE_OPENAI_API_KEY` **unset**. The pipeline will authenticate via `DefaultAzureCredential` (Entra ID token).
+
+```dotenv
+PROVIDER=azure
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+# AZURE_OPENAI_API_KEY is intentionally omitted — using Entra ID / RBAC
+AZURE_OPENAI_API_VERSION=2024-12-01-preview
+
+SLM_MODEL=gpt-5-mini
+LLM_MODEL=gpt-5
+EMBEDDING_MODEL=text-embedding-3-small
+```
+
+Prerequisites for keyless auth:
+- `pip install azure-identity`
+- `az login` with an identity that has the **Cognitive Services OpenAI User** role on the resource
+
+The pipeline auto-detects: if `AZURE_OPENAI_API_KEY` is set it uses key auth, otherwise it falls back to `DefaultAzureCredential`. No code changes required.
 
 ## Algorithm & Approach
 
@@ -217,9 +237,21 @@ The enriched text is also patched in-place: any remaining `{FOOTNOTE [N]: MISSIN
 | Step | Description |
 |---|---|
 | **Enriched Chunker** | Splits stitched text with `RecursiveCharacterTextSplitter`, but first collapses newlines inside `{FOOTNOTE ...}` blocks so the splitter treats each annotation as a single token — preventing footnote blocks from being split across chunks. |
-| **Dual FAISS Retrieval** | Two independent vector stores are built (raw chunks vs. enriched chunks) using the same embedding model. Top-K similarity search retrieves the most relevant chunks for summarization. |
-| **LLM Summarization** | The "Executive" LLM receives retrieved chunks and system prompts from external files (`llm-prompt-raw.txt`, `llm-prompt-enriched.txt`). The enriched prompt explicitly instructs the LLM to incorporate `{FOOTNOTE}` qualifications and not present claims as unqualified facts. |
-| **Reports** | A Markdown comparison report, a matplotlib heatmap showing footnote density per chunk, and a self-contained interactive HTML audit report with scorecard, chunk inspector, and footnote registry. |
+| **Multi-Query FAISS Retrieval** | Two independent vector stores are built (raw chunks vs. enriched chunks) using the same embedding model. Instead of a single generic query, **5 topical sub-queries** are run against each store (financial performance, cash flow/liquidity, risks, outlook, operational highlights). Results are deduplicated, giving the LLM significantly broader context than a single top-K retrieval. |
+| **LLM Summarization** | The "Executive" LLM receives the combined retrieved chunks and system prompts from external files (`llm-prompt-raw.txt`, `llm-prompt-enriched.txt`). The enriched prompt explicitly instructs the LLM to incorporate `{FOOTNOTE}` qualifications and not present claims as unqualified facts. |
+| **Reports** | A Markdown comparison report, a matplotlib heatmap showing footnote density per chunk, and a self-contained interactive HTML audit report with scorecard, chunk inspector, footnote registry, and **sentence-level semantic diff**. |
+
+### Semantic Diff & Colour Coding
+
+The HTML audit report includes a visual semantic diff of the two summaries. Each sentence is embedded and compared by cosine similarity (threshold 0.82):
+
+| Colour | Meaning |
+|---|---|
+| **Amber left-border** | Sentence appears only in the baseline summary — information not surfaced by footnote stitching |
+| **Green left-border** | Sentence appears only in the enriched summary — new context added by footnote stitching |
+| No border | Sentence is semantically shared by both summaries |
+
+This makes it immediately visible what the SLM enrichment adds (green) and what it might lose (amber).
 
 ### Prompt Externalization
 
@@ -252,11 +284,27 @@ rag-footprint/
 ├── data/
 │   ├── Footnote_Validation_Doc.txt          # Minimal test document (3 footnotes)
 │   └── Exemplar_Corp_Q3_2025_Earnings.pdf   # Generated sample (40 footnotes)
+├── examples/                                 # Pre-built sample outputs (Exemplar Corp)
+│   ├── audit_report_*.html                   # Interactive HTML audit report
+│   ├── heatmap_*.png                         # Footnote coverage heatmap
+│   └── summary_report_*.md                   # Markdown summary report
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
 └── README.md
 ```
+
+## Sample Output
+
+The `examples/` directory contains pre-built outputs from a pipeline run on the Exemplar Corp Q3 2025 Earnings document:
+
+| File | Description |
+|---|---|
+| `audit_report_*.html` | Interactive HTML report with semantic diff — open in a browser to explore baseline vs. enriched summaries side-by-side |
+| `heatmap_*.png` | Visual heatmap showing footnote coverage across document chunks |
+| `summary_report_*.md` | Markdown summary with retrieval stats, key differences, and colour-coding legend |
+
+These files are regeneratable via `--rerender` and require no API calls.
 
 ## License
 

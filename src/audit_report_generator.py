@@ -6,6 +6,7 @@ footnotes were "stitched" into the main text by the SLM pre-processor.
 
 Features:
   - Side-by-side raw vs enriched text with syntax highlighting
+  - Semantic diff: sentences with novel meaning are color-coded
   - Inline footnote annotations highlighted in color
   - Chunk boundary visualization
   - Footnote completeness scorecard
@@ -14,10 +15,127 @@ Features:
 
 import base64
 import html
+import math
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Optional
+
+
+# ---------------------------------------------------------------------------
+# Sentence splitting helper
+# ---------------------------------------------------------------------------
+_SENTENCE_RE = re.compile(
+    r"(?<=[.!?;])\s+(?=[A-Z\"\u201c(])"
+    r"|(?<=\n)\s*"
+)
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split *text* into sentence-like segments for semantic comparison."""
+    parts = _SENTENCE_RE.split(text.strip())
+    merged: list[str] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if merged and len(p) < 30:
+            merged[-1] = merged[-1] + " " + p
+        else:
+            merged.append(p)
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Cosine similarity (pure-Python, no numpy dependency)
+# ---------------------------------------------------------------------------
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    mag_a = math.sqrt(sum(x * x for x in a))
+    mag_b = math.sqrt(sum(x * x for x in b))
+    if mag_a == 0 or mag_b == 0:
+        return 0.0
+    return dot / (mag_a * mag_b)
+
+
+# ---------------------------------------------------------------------------
+# Semantic diff: classify each sentence as "shared" or "novel"
+# ---------------------------------------------------------------------------
+def _compute_semantic_diff(
+    sentences_a: list[str],
+    sentences_b: list[str],
+    embeddings_model,
+    threshold: float = 0.82,
+) -> tuple[list[bool], list[bool]]:
+    """
+    Embed both sentence lists and return boolean masks indicating which
+    sentences are **novel** (no close semantic match on the other side).
+
+    Returns:
+        (novel_a, novel_b) \u2014 True means that sentence is semantically
+        different from anything in the other summary.
+    """
+    all_texts = sentences_a + sentences_b
+    if not all_texts:
+        return [], []
+
+    vecs = embeddings_model.embed_documents(all_texts)
+    vecs_a = vecs[: len(sentences_a)]
+    vecs_b = vecs[len(sentences_a) :]
+
+    def _max_sim(vec: list[float], targets: list[list[float]]) -> float:
+        if not targets:
+            return 0.0
+        return max(_cosine_similarity(vec, t) for t in targets)
+
+    novel_a = [_max_sim(v, vecs_b) < threshold for v in vecs_a]
+    novel_b = [_max_sim(v, vecs_a) < threshold for v in vecs_b]
+    return novel_a, novel_b
+
+
+# ---------------------------------------------------------------------------
+# Apply highlights to markdown-converted HTML
+# ---------------------------------------------------------------------------
+def _apply_semantic_highlights(
+    md_html: str,
+    original_text: str,
+    novel_mask: list[bool],
+    sentences: list[str],
+    css_class: str,
+) -> str:
+    """
+    Find each *novel* sentence inside the rendered *md_html* and wrap it
+    in a ``<span class="css_class">`` so it gets a colored left-border.
+    """
+    result = md_html
+    for sent, is_novel in zip(sentences, novel_mask):
+        if not is_novel:
+            continue
+        # Take a distinctive fragment (first 80 chars, HTML-escaped)
+        fragment = html.escape(sent[:80])
+        # Also handle **bold** \u2192 <strong>bold</strong> already applied
+        fragment_bold = re.sub(
+            r"\*\*(.+?)\*\*", r"<strong>\1</strong>", fragment
+        )
+        for needle in (fragment_bold, fragment):
+            idx = result.find(needle)
+            if idx != -1:
+                end_idx = idx + len(needle)
+                rest = result[end_idx:]
+                m_end = re.search(r"(?<=[.!?])\s|</(?:p|li|h\d)>", rest)
+                if m_end:
+                    end_idx += m_end.start()
+                span_open = f'<span class="{css_class}">'
+                span_close = "</span>"
+                result = (
+                    result[:idx]
+                    + span_open
+                    + result[idx:end_idx]
+                    + span_close
+                    + result[end_idx:]
+                )
+                break
+    return result
 
 
 def _highlight_footnotes_html(text: str) -> str:
@@ -156,6 +274,7 @@ def generate_audit_report(
     source_name: str = "Document",
     slm_model: str = "",
     llm_model: str = "",
+    embeddings_model=None,
 ) -> str:
     """
     Generate a self-contained interactive HTML audit report.
@@ -187,6 +306,42 @@ def generate_audit_report(
             f'<td>{html.escape(fn.get("text", "N/A"))}</td>'
             f'<td class="{status_class}">{status_icon} {fn.get("status", "unknown")}</td></tr>'
         )
+
+    # --- Semantic diff of summaries ---
+    raw_diff_html = _md_to_html(raw_summary)
+    enriched_diff_html = _md_to_html(enriched_summary)
+    diff_legend = ""
+
+    if embeddings_model and raw_summary and enriched_summary:
+        try:
+            raw_sents = _split_sentences(raw_summary)
+            enr_sents = _split_sentences(enriched_summary)
+            novel_raw, novel_enr = _compute_semantic_diff(
+                raw_sents, enr_sents, embeddings_model
+            )
+            raw_diff_html = _apply_semantic_highlights(
+                raw_diff_html, raw_summary, novel_raw, raw_sents, "sem-diff-baseline"
+            )
+            enriched_diff_html = _apply_semantic_highlights(
+                enriched_diff_html, enriched_summary, novel_enr, enr_sents, "sem-diff-enriched"
+            )
+            n_raw = sum(novel_raw)
+            n_enr = sum(novel_enr)
+            diff_legend = (
+                f'<div style="margin-top:1rem;font-size:0.85rem;color:var(--gray);'
+                f'line-height:1.7">'
+                f'<strong>Semantic Diff Legend</strong><br>'
+                f'<span class="sem-diff-baseline" style="padding:2px 6px">'
+                f"Amber border</span> = claim appears <em>only</em> in baseline — "
+                f"information not surfaced by footnote stitching ({n_raw} sentences)<br>"
+                f'<span class="sem-diff-enriched" style="padding:2px 6px">'
+                f"Green border</span> = insight appears <em>only</em> in enriched — "
+                f"new context added by footnote stitching ({n_enr} sentences)<br>"
+                f"No border = semantically shared by both summaries</div>"
+            )
+            print(f"[audit_report] Semantic diff: {n_raw} novel baseline, {n_enr} novel enriched sentences")
+        except Exception as e:
+            print(f"[audit_report] Semantic diff skipped: {e}")
 
     raw_chunks_html = _chunk_to_html(raw_chunks, "raw")
     enriched_chunks_html = _chunk_to_html(enriched_chunks, "enriched")
@@ -252,6 +407,10 @@ def generate_audit_report(
   .status-fail {{ color: var(--red); font-weight: 700; }}
   .summary-box {{ background: #f3f4f6; border-radius: 8px; padding: 1.25rem;
                  margin-top: 1rem; line-height: 1.7; }}
+  .sem-diff-baseline {{ border-left: 3px solid #f59e0b; background: #fffbeb;
+                        padding: 2px 6px; display: inline; }}
+  .sem-diff-enriched {{ border-left: 3px solid #22c55e; background: #f0fdf4;
+                        padding: 2px 6px; display: inline; }}
   .tab-container {{ display: flex; gap: 0; margin-bottom: 0; }}
   .tab {{ padding: 0.75rem 1.5rem; cursor: pointer; background: #e5e7eb;
          border: none; font-weight: 600; font-size: 0.9rem; border-radius: 8px 8px 0 0;
@@ -314,13 +473,14 @@ def generate_audit_report(
     <div class="columns">
       <div>
         <h3 style="color:var(--amber)">Baseline (Without SLM)</h3>
-        <div class="summary-box">{_md_to_html(raw_summary)}</div>
+        <div class="summary-box">{raw_diff_html}</div>
       </div>
       <div>
         <h3 style="color:var(--green)">Enriched (With SLM)</h3>
-        <div class="summary-box">{_md_to_html(enriched_summary)}</div>
+        <div class="summary-box">{enriched_diff_html}</div>
       </div>
     </div>
+    {diff_legend}
   </div>
 
   <!-- Chunk Inspector -->
